@@ -59,6 +59,7 @@ dkms.conf
 Debug/
 Release/
 *.launch
+build/
 
 # IDE workspace metadata
 .metadata/
@@ -72,3 +73,5 @@ Release/
 *.hex
 *.map
 *.su
+
+.vscode
