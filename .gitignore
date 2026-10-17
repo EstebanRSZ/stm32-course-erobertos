@@ -63,6 +63,7 @@ Release/
 # IDE workspace metadata
 .metadata/
 .settings/
+.vscode/
 
 # Build artifacts
 *.o
