@@ -27,9 +27,10 @@
   El Hardware utilizado es:
   - El LED de estado (blinky) conectado a PH1 mediante la tarjeta didactica, que permite verificar que el microcontrolador se encuentra en funcionamiento.
   - LED RGB donde cada uno de sus anodos son conectados a resistencias de 1k Ohms.
-  - Amplificador Operacional MCP6004 en modo Buffer/seguidor de voltaje.
+  - Amplificador Operacional MCP6004 en modo Buffer/seguidor de voltaje con una resistencia de 220ohms en la salida con un extremo libre.
   - Capacitores 104 (100nF) y Resistencias de 3.3k ohms para filtros pasa bajos.
   - Encoder
+  - Jumper para el pin de captura de frecuencia (PA5) que permite medir la frecuencia de una señal externa.
 
   Conexiones utilizadas:
         PH1: Blinky en la tarjeta didáctica (salida)
@@ -55,30 +56,38 @@
   - TIM3 genera los 4 PWM (R, G, B y DAC). Comparten ARR, es decir, la misma frecuencia, y cada canal tiene su propio CCR (duty).
   - TIM5 (32 bits) en modo encoder lee CLK y DT con filtro. No genera interrupcion: la FSM lo consulta.
   - TIM2 (32 bits) en captura mide la frecuencia de la señal que entra por PA5.
-  - EXTI0 atiende el boton SW del encoder (PC0).
+  - EXTI0 atiende el boton SW del encoder (PC0): su ISR solo sube button_edge_flag (primer flanco de bajada, todavia no es una pulsacion confirmada).
+  - TIM4 (Timer_E) hace el debounce del boton SW. Es un temporizador de un solo disparo (one-pulse) de 30 ms: la ISR solo sube debounce_flag
+    al vencer. Quien decide es la FSM: al recibir el primer flanco bloquea EXTI0 y arranca TIM4 (los rebotes se ignoran); al vencer la ventana
+    vuelve a habilitar EXTI0 y, si PC0 sigue en bajo (el boton sigue presionado), cambia de modo. Si PC0 ya esta en alto fue ruido.
 
-  El codigo entonces contienr las ISR que solo suben banderas y la FSM las convierte en eventos
+  Resumen de timers: TIM11 (Timer_A, blinky), TIM3 (Timer_B, 4 PWM), TIM2 (Timer_C, captura de frecuencia),
+  TIM5 (Timer_D, encoder) y TIM4 (Timer_E, debounce del SW1).
+
+  Por tanto en el codigo se tiene que las ISR "solo" suben banderas y la FSM las convierte en eventos
 
 
   ===================== FSM =====================
 
   STATE_IDLE es el unico estado que lee eventos. Cada evento lleva a un estado que hace UNA tarea y vuelve a IDLE.
 
-  Estado actual      Evento              Estado siguiente    Accion [ENTER]
-  -----------------  ------------------  ------------------  ---------------------------------------------
-  STATE_IDLE         EV_BUTTON           STATE_NEXT_MODE     -
-  STATE_IDLE         EV_ENCODER_CHANGED  STATE_UPDATE_PWM    -
-  STATE_IDLE         EV_CAPTURE_READY    STATE_UPDATE_FREQ   -
-  STATE_IDLE         EV_BLINK_TICK       STATE_BLINK         -
-  STATE_NEXT_MODE    (incondicional)     STATE_IDLE          edit_mode pasa al siguiente (R, G, B, RGB, DAC)
-  STATE_UPDATE_PWM   (incondicional)     STATE_IDLE          pwm_ApplySteps(encoder_TakeSteps())
-  STATE_UPDATE_FREQ  (incondicional)     STATE_IDLE          freq_Update()
-  STATE_BLINK        (incondicional)     STATE_IDLE          led_Toggle()
-  STATE_ERROR        (cualquiera)        STATE_IDLE          recuperacion
+  Estado actual         Evento / condicion   Estado siguiente    Accion [ENTER]
+  --------------------  -------------------  ------------------  ---------------------------------------------
+  STATE_IDLE            EV_BUTTON_EDGE       STATE_DEBOUNCE_START -
+  STATE_IDLE            EV_DEBOUNCE_DONE     STATE_DEBOUNCE_CHECK -
+  STATE_IDLE            EV_ENCODER_CHANGED   STATE_UPDATE_PWM    -
+  STATE_IDLE            EV_BLINK_TICK        STATE_BLINK         -
+  STATE_IDLE            EV_CAPTURE_READY     STATE_UPDATE_FREQ   -
+  STATE_DEBOUNCE_START  (incondicional)      STATE_IDLE          button_StartDebounce(): bloquea EXTI0 y arranca TIM4
+  STATE_DEBOUNCE_CHECK  PC0 sigue en bajo    STATE_NEXT_MODE     button_EndDebounce(): vuelve a habilitar EXTI0
+  STATE_DEBOUNCE_CHECK  PC0 ya esta en alto  STATE_IDLE          button_EndDebounce() (era ruido)
+  STATE_NEXT_MODE       (incondicional)      STATE_IDLE          edit_mode pasa al siguiente (R, G, B, RGB, DAC)
+  STATE_UPDATE_PWM      (incondicional)      STATE_IDLE          pwm_ApplySteps(encoder_TakeSteps())
+  STATE_UPDATE_FREQ     (incondicional)      STATE_IDLE          freq_Update()
+  STATE_BLINK           (incondicional)      STATE_IDLE          led_Toggle()
+  STATE_ERROR           (cualquiera)         STATE_IDLE          recuperacion
 
-  Prioridad en fsm_GetNextEvent(): boton > encoder > blinky > captura.
-  (La captura va de ultima porque su bandera se sube en cada periodo de la señal medida y, si tuviera
-  prioridad, podria dejar sin atender al blinky.)
+  Prioridad en get_next_event(): primer flanco del boton > fin del debounce > encoder > captura > blinky.
 
 */
 
@@ -86,20 +95,24 @@
 #include <stm32f4xx.h> 
 #include <stdint.h>
 
-/* Constantes del PWM (PSC = 0, ARR = 999 -> 16 kHz y 1000 pasos de duty). Con estos valores CCR = 0 es 0 % y CCR = PWM_ARR + 1 es 100 %. */
-#define PWM_ARR             999 // Es el valor del periodo del PWM. Con PSC = 0 y ARR = 999 son periodos de 1000 ticks de 62.5 ns( frecuencia de 16 kHz)
+/* Constantes del PWM */
+#define PWM_PSC             0      // Prescaler del PWM. Con PSC = 0 (tick de 1 us) y ARR = 999 son periodos de 1000 ticks de 1 us (frecuencia de 16 kHz)
+#define PWM_ARR             999 // Valor del periodo del PWM. Con PSC = 0 (tick de 1 us) y ARR = 999 son periodos de 1000 ticks de 1 us (frecuencia de 16 kHz)
 #define PWM_DUTY_MAX        (PWM_ARR + 1)
 #define PWM_DUTY_STEP       10      // Cuanto cambia el CCR por cada paso del encoder
 #define ENCODER_COUNTS_STEP 4       // Modo encoder 3: 4 cuentas de CNT por paso mecanico
 #define TIMER_CLK_HZ        16000000UL // Frecuencia del reloj del timer (16 MHz)
 #define CAPTURE_PSC         0       // PSC de TIM2 en captura: 0 -> 1 tick = 62.5 ns
 #define CAPTURE_TICK_HZ     (TIMER_CLK_HZ / (CAPTURE_PSC + 1))
+#define DEBOUNCE_MS         30      // Duracion de la ventana de debounce de TIM4 (1 tick = 1 ms), mayor que el tiempo tipico de rebote del boton
 
 
 /* Estados de la FSM (el QUE) */
 typedef enum {
     STATE_IDLE,         // Reposo: unico estado que lee eventos
-    STATE_NEXT_MODE,    // Atiende el boton: cambia el color/canal que edita el encoder
+    STATE_DEBOUNCE_START, // Atiende el primer flanco del boton: bloquea EXTI0 y arranca la ventana de TIM4
+    STATE_DEBOUNCE_CHECK, // Atiende el fin de la ventana: habilita EXTI0 y confirma si el boton sigue presionado
+    STATE_NEXT_MODE,    // Atiende la pulsacion confirmada: cambia el color/canal que edita el encoder
     STATE_UPDATE_PWM,   // Atiende el giro del encoder: modifica el CCR del modo activo
     STATE_UPDATE_FREQ,  // Atiende una captura nueva: calcula la frecuencia
     STATE_BLINK,        // Atiende el tick de TIM11: conmuta PH1
@@ -120,7 +133,8 @@ typedef enum {
 /* Eventos de la FSM */
 typedef enum {
     EV_NONE,
-    EV_BUTTON,
+    EV_BUTTON_EDGE,     // Primer flanco de bajada del boton (aun puede ser un rebote)
+    EV_DEBOUNCE_DONE,   // Vencio la ventana de debounce de TIM4
     EV_ENCODER_CHANGED,
     EV_CAPTURE_READY,
     EV_BLINK_TICK
@@ -132,14 +146,15 @@ State_t current_state = STATE_IDLE; // Estado actual de la FSM, inicia en estado
 Mode_t edit_mode = MODE_RED; // Modo de edicion actual, que canal modifica el encoder. Inicia en rojo.
 uint8_t state_entry_flag = 1;   // Bandera que indica si se acaba de entrar a un estado.
 
-volatile uint8_t button_flag = 0;     /* La sube la ISR de EXTI0 */
-volatile uint8_t capture_flag = 0;    /* La sube la ISR de TIM2 */
-volatile uint8_t blink_flag = 0;      /* La sube la ISR de TIM11 */
+volatile uint8_t button_edge_flag = 0; // La sube la ISR de EXTI0 en el flanco de bajada del boton 
+volatile uint8_t debounce_flag = 0;   // La sube la ISR de TIM4 al vencer la ventana de debounce 
+volatile uint8_t capture_flag = 0;    // La sube la ISR de TIM2 
+volatile uint8_t blink_flag = 0;      // La sube la ISR de TIM11 
 
-volatile uint32_t capture_last = 0;   /* Ultimo flanco capturado: solo lo usa la ISR de TIM2 */
-volatile uint32_t capture_period = 0; /* Periodo en ticks entre los dos ultimos flancos: la ISR lo escribe, y en main se lee */
+volatile uint32_t capture_last = 0;   // Ultimo flanco capturado: solo lo usa la ISR de TIM2 
+volatile uint32_t capture_period = 0; // Periodo en ticks entre los dos ultimos flancos: la ISR lo escribe, y en main se lee 
 
-volatile uint32_t freq_hz = 0;        /* Frecuencia medida: variable para ver en Live Watch de VS Code */
+volatile uint32_t freq_hz = 0;        // Frecuencia medida: variable para ver en Live Watch de VS Code 
 
 int32_t duty_red = 0; // Valor del duty del canal rojo (CCR1 de TIM3), inicia en 0 (apagado)
 int32_t duty_green = 0; // Valor del duty del canal verde (CCR2 de TIM3), inicia en 0 (apagado)
@@ -153,23 +168,28 @@ void init_timer_BLINKY(void);
 void init_timer3_pwm(void);
 void init_tim5_encoder(void);
 void init_tim2_capture(void);
+void init_tim4_debounce(void);
 void exti0_init(void);
 
 /* ISR */
 void TIM1_TRG_COM_TIM11_IRQHandler(void);
 void EXTI0_IRQHandler(void);
 void TIM2_IRQHandler(void);
+void TIM4_IRQHandler(void);
 
 /* Funcion privada del modulo */
 static int32_t pwm_Saturate(int32_t duty); // Limita el duty entre 0 y PWM_DUTY_MAX
 
 
 /* Drivers de la FSM (el COMO) */
-Event_t get_next_event(void);
-int32_t encoder_TakeSteps(void);
-void pwm_ApplySteps(int32_t steps);
-void freq_Update(void);
-void led_Toggle(void);
+Event_t get_next_event(void); // Se obtiene el siguiente evento de la FSM
+int32_t encoder_TakeSteps(void); // Devuelve los pasos completos acumulados (+ horario, - antihorario) y los descuenta del contador TIM5
+void pwm_ApplySteps(int32_t steps); // Aplica los pasos del encoder al duty del modo activo (edit_mode) y escribe los CCR de TIM3
+void freq_Update(void); // Convierte el periodo capturado en frecuencia y la guarda en freq_hz
+void led_Toggle(void); // Conmuta el estado del LED PH1
+void button_StartDebounce(void);    // Bloquea EXTI0 y arranca la ventana de TIM4
+void button_EndDebounce(void);      // Vuelve a habilitar EXTI0 al terminar la ventana
+uint8_t button_IsPressed(void);     // 1 si PC0 esta en bajo (boton presionado)
 
 
 int main(void)
@@ -177,6 +197,7 @@ int main(void)
     Event_t current_event = EV_NONE;
 
     init_gpio();
+    init_tim4_debounce(); // la ISR del boton usa TIM4, que debe estar listo
     exti0_init();
     init_timer3_pwm();
     init_tim5_encoder();
@@ -202,10 +223,15 @@ int main(void)
 
             current_event = get_next_event(); // Obtenemos el siguiente evento de la FSM
 
-            if (current_event == EV_BUTTON) // Evento de botón presionado
+            if (current_event == EV_BUTTON_EDGE) // Primer flanco del boton: aun no es una pulsacion confirmada
             {
-                current_state = STATE_NEXT_MODE; // Cambiamos al estado de siguiente modo
-                state_entry_flag = 1; // Subimos la bandera hacia NEXT_MODE
+                current_state = STATE_DEBOUNCE_START; // Cambiamos al estado que inicia el debounce
+                state_entry_flag = 1; // Subimos la bandera hacia DEBOUNCE_START
+            }
+            else if (current_event == EV_DEBOUNCE_DONE) // Vencio la ventana de debounce
+            {
+                current_state = STATE_DEBOUNCE_CHECK; // Cambiamos al estado que confirma la pulsacion
+                state_entry_flag = 1; // Subimos la bandera hacia DEBOUNCE_CHECK
             }
             else if (current_event == EV_ENCODER_CHANGED) // Evento de cambio en el encoder
             {
@@ -222,6 +248,35 @@ int main(void)
                 current_state = STATE_BLINK; // Estado de parpadeo
                 state_entry_flag = 1; // Subimos la bandera hacia BLINK
             }
+            break;
+
+        case STATE_DEBOUNCE_START: // Estado que inicia la ventana de debounce
+            if (state_entry_flag)
+            {
+                button_StartDebounce(); // Bloqueamos EXTI0 (los rebotes ya no interrumpen) y arrancamos TIM4
+                state_entry_flag = 0; // Bajamos la bandera
+            }
+
+            current_state = STATE_IDLE; // Volvemos al estado de reposo mientras corre la ventana (no se bloquea)
+            state_entry_flag = 1; // Subimos la bandera hacia IDLE
+            break;
+
+        case STATE_DEBOUNCE_CHECK: // Estado que confirma la pulsacion al terminar la ventana
+            if (state_entry_flag)
+            {
+                button_EndDebounce(); // Volvemos a habilitar EXTI0
+                state_entry_flag = 0; // Bajamos la bandera
+            }
+
+            if (button_IsPressed()) // PC0 sigue en bajo: el boton esta presionado, la pulsacion es valida
+            {
+                current_state = STATE_NEXT_MODE; // Cambiamos al estado de siguiente modo
+            }
+            else // PC0 ya esta en alto: fue ruido
+            {
+                current_state = STATE_IDLE; // Volvemos al estado de reposo sin cambiar de modo
+            }
+            state_entry_flag = 1; // Subimos la bandera hacia el estado siguiente
             break;
 
         case STATE_NEXT_MODE: // Estado de cambio de modo
@@ -295,14 +350,20 @@ int main(void)
 
 /*============ Funciones driver de la FSM (el COMO) ============ */
 
-/* Convierte las banderas de las ISR y el encoder en UN evento, con la prioridad: boton > encoder > blinky > captura*/
+/* Convierte las banderas de las ISR y el encoder en UN evento, con la prioridad: flanco del boton > fin del debounce > encoder > captura > blinky */
 Event_t get_next_event(void)
 {
 
-    if (button_flag == 1) // Bandera del boton SW del encoder
+    if (button_edge_flag == 1) // Bandera del primer flanco del boton SW del encoder
     {
-        button_flag = 0; // Bajamos la bandera
-        return EV_BUTTON; // Retornamos el evento de botón presionado
+        button_edge_flag = 0; // Bajamos la bandera
+        return EV_BUTTON_EDGE; // Retornamos el evento de primer flanco del boton
+    }
+
+    if (debounce_flag == 1) // Bandera de fin de la ventana de debounce (TIM4)
+    {
+        debounce_flag = 0; // Bajamos la bandera
+        return EV_DEBOUNCE_DONE; // Retornamos el evento de fin de debounce
     }
 
     
@@ -390,7 +451,7 @@ void pwm_ApplySteps(int32_t steps)
     TIM3->CCR4 = (uint32_t) duty_dac; // Asignamos el nuevo duty del canal DAC al canal 4 de TIM3
 }
 
-/*  Convierte el periodo capturado (en ticks) en frecuencia y se guarda en freq_hz */
+//  Convierte el periodo capturado (en ticks) en frecuencia y se guarda en freq_hz
 void freq_Update(void)
 {
 
@@ -415,16 +476,38 @@ static int32_t pwm_Saturate(int32_t duty)
     return duty; // Retornamos el duty sin cambios si está dentro del rango permitido
 }
 
-// Cambia el estado del LED PH1 
+// Cambia el estado del LED PH1
 void led_Toggle(void)
 {
     GPIOH->ODR ^= GPIO_ODR_OD1; // XOR con 1 para conmutar el estado del Blinky
 }
 
+// Inicia el debounce del boton SW
+void button_StartDebounce(void)
+{
+    EXTI->IMR &= ~EXTI_IMR_MR0; // Enmascaramos la linea 0 (EXTI0)
+    EXTI->PR = EXTI_PR_PR0; // Se baja el pendiente escribiendo 1 en el bit
+    TIM4->CNT = 0; // Reiniciamos el contador de TIM4 a cero
+    TIM4->CR1 |= TIM_CR1_CEN; // Arranca la ventana de debounce
+}
+
+//  Termina la ventana de debounce
+void button_EndDebounce(void)
+{
+    EXTI->PR = EXTI_PR_PR0; // Bajamos el pendiente de los rebotes, si no, EXTI0 dispararia otra interrupcion de inmediato
+    EXTI->IMR |= EXTI_IMR_MR0; // Volvemos a habilitar la linea EXTI0
+}
+
+// Devuelve 1 si el boton esta presionado (PC0 en bajo, tiene pull-up) y 0 si no
+uint8_t button_IsPressed(void)
+{
+    return ((GPIOC->IDR & GPIO_IDR_ID0) == 0) ? 1 : 0;
+}
+
 
 /*============ Funciones de inicialización del hardware ============ */
 
-void init_gpio()
+void init_gpio(void)
 {
 
     /* Habilitamos el reloj del puerto GPIOH, que es para el Blinky de la Tarjeta didáctica */
@@ -512,7 +595,7 @@ void init_timer3_pwm(void)
 {
     RCC->APB1ENR |= RCC_APB1ENR_TIM3EN;     /* Reloj de TIM3 */
 
-    TIM3->PSC = 16-1; //Tick de 1 us
+    TIM3->PSC = PWM_PSC; //Tick de 1 us
     TIM3->ARR = PWM_ARR;
     TIM3->CCR1 = 0; // Definimos el ancho del pulso Inicialmente en 0, el duty inicia en 0 para el canal rojo
     TIM3->CCR2 = 0; // Definimos el ancho del pulso Inicialmente en 0, el duty inicia en 0 para el canal verde
@@ -573,6 +656,22 @@ void init_tim2_capture(void)
     TIM2->CR1 |= TIM_CR1_CEN;               // Arranca el contador, siempre de ultimo 
 }
 
+/*  TIM4 (Timer_E): ventana de debounce del boton SW (PC0) de DEBOUNCE_MS milisegundos. */
+void init_tim4_debounce(void)
+{
+    RCC->APB1ENR |= RCC_APB1ENR_TIM4EN; // Reloj de TIM4
+
+    TIM4->PSC = 16000 - 1; // 16 MHz / 16000 = 1 kHz (tick de 1 ms)
+    TIM4->ARR = DEBOUNCE_MS - 1; // La ventana dura DEBOUNCE_MS ticks
+    TIM4->CR1 |= TIM_CR1_OPM; // One-pulse: se detiene al terminar la cuenta
+
+    TIM4->EGR |= TIM_EGR_UG; // Fuerza una actualizacion para cargar PSC y ARR (osino la primera ventana usaria PSC = 0)
+    TIM4->SR &= ~TIM_SR_UIF; // La actualizacion forzada sube UIF, se baja antes de habilitar la interrupcion
+
+    TIM4->DIER |= TIM_DIER_UIE; // Interrupcion por vencimiento de la ventana 
+    NVIC_EnableIRQ(TIM4_IRQn); // Matriculamos la interrupcion de TIM4 en el NVIC
+}
+
 /* EXTI0 para PC0 (SW del encoder) */
 void exti0_init(void)
 {
@@ -599,13 +698,23 @@ void TIM1_TRG_COM_TIM11_IRQHandler(void)
     }
 }
 
-/* Boton SW (PC0)  */
+/* Boton SW (PC0): primer flanco de bajada. Solo deja la bandera, la FSM decide que hacer (STATE_DEBOUNCE_START) */
 void EXTI0_IRQHandler(void)
 {
     if (EXTI->PR & EXTI_PR_PR0) // Verificamos si la bandera esta subida.
     {
         EXTI->PR = EXTI_PR_PR0; // Se baja escribiendo 1 en el bit, no 0 como TIM->SR.
-        button_flag = 1;        // La FSM lo convierte en EV_BUTTON
+        button_edge_flag = 1; // La FSM lo convierte en EV_BUTTON_EDGE
+    }
+}
+
+/* Vence la ventana de debounce de TIM4 (Timer_E). Solo deja la bandera, la FSM decide que hacer (STATE_DEBOUNCE_CHECK) */
+void TIM4_IRQHandler(void)
+{
+    if (TIM4->SR & TIM_SR_UIF) // Verificamos si la bandera esta subida.
+    {
+        TIM4->SR &= ~TIM_SR_UIF; // Bajamos la bandera, limpiando el registro.
+        debounce_flag = 1; // La FSM lo convierte en EV_DEBOUNCE_DONE
     }
 }
 

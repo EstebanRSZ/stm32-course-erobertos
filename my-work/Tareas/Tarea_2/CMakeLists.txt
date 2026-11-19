@@ -13,12 +13,12 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/target.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/gcc-arm-none-eabi.cmake)
 
 # Project definition
-project(Taller_2)
+project(Tarea_2)
 
 # Enable CMake support for ASM and C/CPP languages
 enable_language(C ASM)
 
-set(PROJECT_NAME Taller_2)
+set(PROJECT_NAME Tarea_2)
 
 #Ruta al paquete de firmeware de ST para la familia STM32F4
 set(CMSIS_ROOT "/home/esteban_rs/STM32Cube/Repository/STM32Cube_FW_F4_V1.28.0")
